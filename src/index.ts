@@ -4,16 +4,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ErrorCode,
-  ListResourcesRequestSchema,
   ListToolsRequestSchema,
   McpError,
-  ReadResourceRequestSchema,
+  Request,
 } from '@modelcontextprotocol/sdk/types.js';
-import { storage } from './storage.js';
-import { SEQUENTIAL_THINKING_PROMPT, formatPlanAsTodos } from './prompts.js';
-import { Goal, Todo } from './types.js';
+import { storage } from './storage';
+import { Goal, Task, TaskResponse } from './types';
 
-class SoftwarePlanningServer {
+export class SoftwarePlanningServer {
   private server: Server;
   private currentGoal: Goal | null = null;
 
@@ -25,321 +23,263 @@ class SoftwarePlanningServer {
       },
       {
         capabilities: {
-          resources: {},
           tools: {},
         },
       }
     );
 
-    this.setupResourceHandlers();
     this.setupToolHandlers();
     
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    this.server.onerror = (error: Error) => console.error('[MCP Error]', error);
   }
 
-  private setupResourceHandlers() {
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: [
-        {
-          uri: 'planning://current-goal',
-          name: 'Current Goal',
-          description: 'The current software development goal being planned',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'planning://implementation-plan',
-          name: 'Implementation Plan',
-          description: 'The current implementation plan with todos',
-          mimeType: 'application/json',
-        },
-      ],
-    }));
-
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      switch (request.params.uri) {
-        case 'planning://current-goal': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
-              'No active goal. Start a new planning session first.'
-            );
-          }
-          return {
-            contents: [
-              {
-                uri: request.params.uri,
-                mimeType: 'application/json',
-                text: JSON.stringify(this.currentGoal, null, 2),
-              },
-            ],
-          };
-        }
-        case 'planning://implementation-plan': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
-              'No active goal. Start a new planning session first.'
-            );
-          }
-          const plan = await storage.getPlan(this.currentGoal.id);
-          if (!plan) {
-            throw new McpError(
-              ErrorCode.InvalidParams,
-              'No implementation plan found for current goal.'
-            );
-          }
-          return {
-            contents: [
-              {
-                uri: request.params.uri,
-                mimeType: 'application/json',
-                text: JSON.stringify(plan, null, 2),
-              },
-            ],
-          };
-        }
-        default:
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `Unknown resource URI: ${request.params.uri}`
-          );
-      }
-    });
-  }
 
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
-          name: 'start_planning',
-          description: 'Start a new planning session with a goal',
+          name: 'create_goal',
+          description: 'Create a new goal',
           inputSchema: {
             type: 'object',
             properties: {
-              goal: {
-                type: 'string',
-                description: 'The software development goal to plan',
-              },
-            },
-            required: ['goal'],
-          },
-        },
-        {
-          name: 'save_plan',
-          description: 'Save the current implementation plan',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              plan: {
-                type: 'string',
-                description: 'The implementation plan text to save',
-              },
-            },
-            required: ['plan'],
-          },
-        },
-        {
-          name: 'add_todo',
-          description: 'Add a new todo item to the current plan',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'Title of the todo item',
-              },
               description: {
                 type: 'string',
-                description: 'Detailed description of the todo item',
+                description: 'The software development goal description (string)',
               },
-              complexity: {
+              repoName: {
+                type: 'string',
+                description: 'The repository name associated with this goal (string)',
+              },
+            },
+            required: ['description', 'repoName'],
+          },
+        },
+        {
+          name: 'add_tasks',
+          description: 'Add multiple tasks to a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1") where each segment represents a level in the hierarchy. The parentId for a subtask is derived from its ID by removing the last segment (e.g., "1.1" is parent of "1.1.1"). Top-level tasks have a null parentId. Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              goalId: {
                 type: 'number',
-                description: 'Complexity score (0-10)',
-                minimum: 0,
-                maximum: 10,
+                description: 'ID of the goal to add tasks to (number)',
               },
-              codeExample: {
-                type: 'string',
-                description: 'Optional code example',
+              tasks: {
+                type: 'array',
+                description: 'An array of new task objects to be added. Each task object must include "title" (string) and "description" (string), and can optionally include "parentId" (string) to define subtasks. Note: The returned task objects will not include `createdAt`, `updatedAt`, or `parentId`.',
+                items: {
+                  type: 'object',
+                  description: 'A single task object. It has the following properties: "title" (string), "description" (string), and optionally "parentId" (string) for subtasks. The `parentId` should be the ID of an existing task. If `parentId` is null, it will be a top-level task.',
+                  properties: {
+                    title: {
+                      type: 'string',
+                      description: 'Title of the task (string)',
+                    },
+                    description: {
+                      type: 'string',
+                      description: 'Detailed description of the task (string)',
+                    },
+                    parentId: {
+                      type: ['string', 'null'],
+                      description: 'Optional parent task ID for subtasks (string). Use null for top-level tasks. Example: "1" for a top-level task, "1.1" for a subtask of "1".',
+                    },
+                  },
+                  required: ['title', 'description'],
+                },
               },
             },
-            required: ['title', 'description', 'complexity'],
+            required: ['goalId', 'tasks'],
           },
         },
         {
-          name: 'remove_todo',
-          description: 'Remove a todo item from the current plan',
+          name: 'remove_tasks',
+          description: 'Remove multiple tasks from a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
           inputSchema: {
             type: 'object',
             properties: {
-              todoId: {
-                type: 'string',
-                description: 'ID of the todo item to remove',
+              goalId: {
+                type: 'number',
+                description: 'ID of the goal to remove tasks from (number)',
               },
-            },
-            required: ['todoId'],
-          },
-        },
-        {
-          name: 'get_todos',
-          description: 'Get all todos in the current plan',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-          },
-        },
-        {
-          name: 'update_todo_status',
-          description: 'Update the completion status of a todo item',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              todoId: {
-                type: 'string',
-                description: 'ID of the todo item',
+              taskIds: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'IDs of the tasks to remove (array of strings). Example: ["1", "1.1"].',
               },
-              isComplete: {
+              deleteChildren: {
                 type: 'boolean',
-                description: 'New completion status',
+                description: 'Whether to delete child tasks along with the parent (boolean). Defaults to false. If false, attempting to delete a parent task with existing subtasks will throw an error.',
+                default: false,
               },
             },
-            required: ['todoId', 'isComplete'],
+            required: ['goalId', 'taskIds'],
+          },
+        },
+        {
+          name: 'get_tasks',
+          description: 'Get tasks for a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              goalId: {
+                type: 'number',
+                description: 'ID of the goal to get tasks for (number)',
+              },
+              includeSubtasks: {
+                type: 'string',
+                description: 'Level of subtasks to include: "none" (only top-level tasks), "first-level" (top-level tasks and their direct children), or "recursive" (all nested subtasks). Defaults to "none".',
+                enum: ['none', 'first-level', 'recursive'],
+                default: 'none',
+              },
+            },
+            required: ['goalId'],
+          },
+        },
+        {
+          name: 'complete_task_status',
+          description: 'Update the completion status of tasks. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              goalId: {
+                type: 'number',
+                description: 'ID of the goal containing the tasks (number)',
+              },
+              taskIds: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'IDs of the tasks to update (array of strings). Example: ["1.1", "1.2"].',
+              },
+              completeChildren: {
+                type: 'boolean',
+                description: 'Whether to complete all child tasks recursively (boolean). Defaults to false. If false, a task can only be completed if all its subtasks are already complete.',
+                default: false,
+              },
+            },
+            required: ['goalId', 'taskIds'],
           },
         },
       ],
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (request: Request) => {
+      if (!request.params) {
+        throw new McpError(ErrorCode.InvalidParams, 'Missing request parameters');
+      }
+
       switch (request.params.name) {
-        case 'start_planning': {
-          const { goal } = request.params.arguments as { goal: string };
-          this.currentGoal = await storage.createGoal(goal);
-          await storage.createPlan(this.currentGoal.id);
+        case 'create_goal': {
+          const { description, repoName } = request.params.arguments as { description: string; repoName: string };
+          const goal = await storage.createGoal(description, repoName);
+          this.currentGoal = goal;
+          await storage.createPlan(goal.id);
 
           return {
             content: [
               {
                 type: 'text',
-                text: SEQUENTIAL_THINKING_PROMPT,
+                text: JSON.stringify({ goalId: goal.id }),
               },
             ],
           };
         }
 
-        case 'save_plan': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidRequest,
-              'No active goal. Start a new planning session first.'
-            );
+        case 'add_tasks': {
+          const { goalId, tasks } = request.params.arguments as {
+            goalId: number;
+            tasks: Array<Omit<Task, 'id' | 'goalId' | 'isComplete' | 'createdAt' | 'updatedAt'>>;
+          };
+
+          const addedTasks: TaskResponse[] = [];
+          const currentBatchTitleToIdMap = new Map<string, string>();
+
+          const existingTasks = await storage.getTasks(goalId, 'recursive');
+          const existingTitleToIdMap = new Map<string, string>();
+          existingTasks.forEach(task => existingTitleToIdMap.set(task.title, task.id));
+
+          for (const task of tasks) {
+            let resolvedParentId: string | null = null;
+            if (task.parentId) {
+              resolvedParentId = currentBatchTitleToIdMap.get(task.parentId) ?? null;
+              if (!resolvedParentId) {
+                resolvedParentId = existingTitleToIdMap.get(task.parentId) ?? null;
+              }
+            }
+
+            const newTask = await storage.addTask(goalId, {
+              ...task,
+              parentId: resolvedParentId
+            });
+            addedTasks.push(newTask);
+            currentBatchTitleToIdMap.set(newTask.title, newTask.id);
           }
 
-          const { plan } = request.params.arguments as { plan: string };
-          const todos = formatPlanAsTodos(plan);
-
-          for (const todo of todos) {
-            await storage.addTodo(this.currentGoal.id, todo);
-          }
+          await storage.initialize();
+          const allTasksInDb = await storage.getTasks(goalId, 'recursive');
+          const totalTasksInDb = allTasksInDb.length;
 
           return {
             content: [
               {
                 type: 'text',
-                text: `Successfully saved ${todos.length} todo items to the implementation plan.`,
+                text: JSON.stringify({ addedTasks, totalTasksInDb }, null, 2),
               },
             ],
           };
         }
 
-        case 'add_todo': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidRequest,
-              'No active goal. Start a new planning session first.'
-            );
-          }
+        case 'remove_tasks': {
+          const { goalId, taskIds, deleteChildren } = request.params.arguments as { goalId: number; taskIds: string[]; deleteChildren?: boolean };
+          const results = await storage.removeTasks(goalId, taskIds, deleteChildren);
 
-          const todo = request.params.arguments as Omit<
-            Todo,
-            'id' | 'isComplete' | 'createdAt' | 'updatedAt'
-          >;
-          const newTodo = await storage.addTodo(this.currentGoal.id, todo);
-
+          const textContent = JSON.stringify(results, null, 2);
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(newTodo, null, 2),
-              },
+                text: textContent,
+              } as { type: 'text'; text: string },
             ],
           };
         }
 
-        case 'remove_todo': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidRequest,
-              'No active goal. Start a new planning session first.'
-            );
-          }
-
-          const { todoId } = request.params.arguments as { todoId: string };
-          await storage.removeTodo(this.currentGoal.id, todoId);
-
+        case 'get_tasks': {
+          const { goalId, includeSubtasks = 'none' } = request.params.arguments as { 
+            goalId: number; 
+            includeSubtasks?: 'none' | 'first-level' | 'recursive';
+          };
+          await storage.initialize();
+          const tasks = await storage.getTasks(goalId, includeSubtasks);
+          const textContent = JSON.stringify(tasks, null, 2);
           return {
             content: [
               {
                 type: 'text',
-                text: `Successfully removed todo ${todoId}`,
-              },
+                text: textContent,
+              } as { type: 'text'; text: string },
             ],
           };
         }
 
-        case 'get_todos': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidRequest,
-              'No active goal. Start a new planning session first.'
-            );
-          }
-
-          const todos = await storage.getTodos(this.currentGoal.id);
-
+        case 'complete_task_status': {
+          const { goalId, taskIds, completeChildren } = request.params.arguments as {
+            goalId: number;
+            taskIds: string[];
+            completeChildren?: boolean;
+          };
+          const results = await storage.completeTasksStatus(goalId, taskIds, completeChildren);
+          const textContent = JSON.stringify(results, null, 2);
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(todos, null, 2),
-              },
-            ],
-          };
-        }
-
-        case 'update_todo_status': {
-          if (!this.currentGoal) {
-            throw new McpError(
-              ErrorCode.InvalidRequest,
-              'No active goal. Start a new planning session first.'
-            );
-          }
-
-          const { todoId, isComplete } = request.params.arguments as {
-            todoId: string;
-            isComplete: boolean;
-          };
-          const updatedTodo = await storage.updateTodoStatus(
-            this.currentGoal.id,
-            todoId,
-            isComplete
-          );
-
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(updatedTodo, null, 2),
-              },
+                text: textContent,
+              } as { type: 'text'; text: string },
             ],
           };
         }
@@ -353,7 +293,7 @@ class SoftwarePlanningServer {
     });
   }
 
-  async run() {
+  async start() {
     await storage.initialize();
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -362,4 +302,7 @@ class SoftwarePlanningServer {
 }
 
 const server = new SoftwarePlanningServer();
-server.run().catch(console.error);
+server.start().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});
