@@ -1,47 +1,16 @@
 # Task Orchestrator
 
-A Model Context Protocol (MCP) server for software planning and task management. This tool helps break down software development goals into manageable tasks and track their progress.
+A Model Context Protocol (MCP) server for task orchestration and management. This tool helps break down goals into manageable tasks and track their progress.
 
 ## Features
 
-- Create and manage software development goals
+- Create and manage goals
 - Break down goals into hierarchical tasks
 - Track task completion status
 - Support for task dependencies and subtasks
 - Persistent storage using LokiDB
 
 ## API Reference
-
-### Resources
-
-The server provides two main resources:
-
-1. `planning://current-goal`
-   - Type: `application/json`
-   - Contains the active software development goal
-   - Example:
-   ```jsonc
-   {
-     "id": 1,
-     "description": "Implement user authentication",
-     "repoName": "user/repo",
-     "createdAt": "2024-03-20T10:00:00Z"
-   }
-   ```
-
-2. `planning://implementation-plan`
-   - Type: `application/json`
-   - Contains the task breakdown for the current goal.
-   // Note: This resource provides plan metadata. The 'tasks' array here will be empty.
-   // Use the 'get_tasks' tool to retrieve the actual task list for the goal.
-   - Example:
-   ```jsonc
-   {
-     "goalId": 1,
-     "tasks": [], // Tasks array is empty here; use get_tasks tool for actual tasks
-     "updatedAt": "2024-03-20T10:00:00Z"
-   }
-   ```
 
 ### Task ID Naming Convention
 
@@ -59,7 +28,7 @@ The server provides the following tools (based on `build/index.js`):
    - Parameters:
      ```typescript
      {
-       description: string;  // The software development goal description
+       description: string;  // The goal description
        repoName: string;     // The repository name associated with this goal
      }
      ```
