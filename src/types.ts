@@ -35,6 +35,24 @@ export interface ImplementationPlan {
 export interface StorageData {
   goals: Record<number, Goal>;
   plans: Record<number, ImplementationPlan>;
-  nextGoalId: number;
-  nextTaskId: Record<string, number>;  // Maps parentId (or 'root' for top-level) to next sequence number
+  nextGoalId: number; // Reverted to original
+  nextTaskId: { [goalId: number]: { [parentId: string]: number } }; // Reverted to original
+}
+
+// New interfaces for add_tasks input and output
+export interface TaskInput {
+  title: string;
+  description: string;
+  parentId?: string | null; // For linking to existing tasks
+  subtasks?: TaskInput[]; // For hierarchical new tasks
+}
+
+export interface AddTasksInput {
+  goalId: number;
+  tasks: TaskInput[];
+}
+
+// For recursive output
+export interface HierarchicalTaskResponse extends TaskResponse {
+  subtasks?: HierarchicalTaskResponse[];
 }

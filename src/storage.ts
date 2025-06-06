@@ -401,56 +401,82 @@ export class Storage {
 
   async getTasks(
     goalId: number,
+    taskIds?: string[],
     includeSubtasks: 'none' | 'first-level' | 'recursive' = 'none',
-    includeDeletedTasks: boolean = false // New parameter
+    includeDeletedTasks: boolean = false
   ): Promise<TaskResponse[]> {
-    let allTasksForGoal = this.tasks.find({ goalId });
+    let tasksToConsider = this.tasks.find({ goalId });
 
     // Filter out deleted tasks unless explicitly requested
     if (!includeDeletedTasks) {
-      allTasksForGoal = allTasksForGoal.filter(task => !task.deleted);
+      tasksToConsider = tasksToConsider.filter(task => !task.deleted);
     }
+
+    let resultTasks: LokiTask[] = [];
+
+    if (taskIds && taskIds.length > 0) {
+      // If specific taskIds are provided, start with those tasks
+      const initialTasks = tasksToConsider.filter(task => taskIds.includes(task.id));
+      resultTasks.push(...initialTasks);
+
+      if (includeSubtasks === 'first-level') {
+        // Add direct children of the initial tasks
+        for (const task of initialTasks) {
+          const directChildren = tasksToConsider.filter(child => child.parentId === task.id);
+          resultTasks.push(...directChildren);
+        }
+      } else if (includeSubtasks === 'recursive') {
+        // Add all recursive children of the initial tasks
+        const addRecursiveChildren = (parentTaskId: string) => {
+          const children = tasksToConsider.filter(child => child.parentId === parentTaskId);
+          for (const child of children) {
+            resultTasks.push(child);
+            addRecursiveChildren(child.id);
+          }
+        };
+        for (const task of initialTasks) {
+          addRecursiveChildren(task.id);
+        }
+      }
+    } else {
+      // If no specific taskIds are provided, fetch tasks based on includeSubtasks
+      if (includeSubtasks === 'none') {
+        resultTasks = tasksToConsider.filter(task => task.parentId === null);
+      } else if (includeSubtasks === 'first-level') {
+        const topLevelTasks = tasksToConsider.filter(task => task.parentId === null);
+        resultTasks.push(...topLevelTasks);
+        for (const task of topLevelTasks) {
+          const directChildren = tasksToConsider.filter(child => child.parentId === task.id);
+          resultTasks.push(...directChildren);
+        }
+      } else if (includeSubtasks === 'recursive') {
+        // For recursive and no specific taskIds, return all tasks (already filtered by deleted status)
+        resultTasks = tasksToConsider;
+      }
+    }
+
+    // Remove duplicates and sort
+    const uniqueResultTasks = Array.from(new Set(resultTasks));
+    
+    // Sort based on task ID structure
+    uniqueResultTasks.sort((a, b) => {
+      const aParts = a.id.split('.').map(Number);
+      const bParts = b.id.split('.').map(Number);
+
+      for (let i = 0; i < Math.min(aParts.length, bParts.length); i++) {
+        if (aParts[i] !== bParts[i]) {
+          return aParts[i] - bParts[i];
+        }
+      }
+      return aParts.length - bParts.length;
+    });
 
     const mapToTaskResponse = (task: LokiTask): TaskResponse => {
       const { createdAt, updatedAt, parentId: _, $loki, meta, ...taskResponse } = task as LokiTask;
       return taskResponse;
     };
 
-    if (includeSubtasks === 'recursive') {
-      // If recursive, return all tasks for the goal (filtered by deleted status)
-      return allTasksForGoal.map(mapToTaskResponse).sort((a, b) => {
-        // Custom sort for recursive to maintain hierarchical order
-        const aParts = a.id.split('.').map(Number);
-        const bParts = b.id.split('.').map(Number);
-
-        for (let i = 0; i < Math.min(aParts.length, bParts.length); i++) {
-          if (aParts[i] !== bParts[i]) {
-            return aParts[i] - bParts[i];
-          }
-        }
-        return aParts.length - bParts.length;
-      });
-    }
-
-    const topLevelTasks = allTasksForGoal.filter(task => task.parentId === null)
-                                         .map(mapToTaskResponse)
-                                         .sort((a, b) => getTaskSequenceNumber(a.id) - getTaskSequenceNumber(b.id));
-
-    if (includeSubtasks === 'none') {
-      return topLevelTasks;
-    }
-
-    // If 'first-level', get top-level tasks and their direct children
-    const resultTasks: TaskResponse[] = [];
-    for (const task of topLevelTasks) {
-      resultTasks.push(task);
-      const directChildren = allTasksForGoal.filter(child => child.parentId === task.id)
-                                            .map(mapToTaskResponse)
-                                            .sort((a, b) => getTaskSequenceNumber(a.id) - getTaskSequenceNumber(b.id));
-      resultTasks.push(...directChildren);
-    }
-
-    return resultTasks;
+    return uniqueResultTasks.map(mapToTaskResponse);
   }
 }
 

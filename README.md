@@ -7,8 +7,12 @@ A Model Context Protocol (MCP) server for task orchestration and management. Thi
 - Create and manage goals
 - Break down goals into hierarchical tasks
 - Track task completion status
-- Support for task dependencies and subtasks
+- Support for subtasks and dependency management between parent task and subtasks
 - Persistent storage using LokiDB
+
+## Roadmap 
+--- Complex task/goal inter-dependency orchestration
+--- Goal deletion
 
 ## API Reference
 
@@ -24,7 +28,7 @@ Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1") where each segment repre
 The server provides the following tools (based on `build/index.js`):
 
 1. `create_goal`
-   - Create a new goal. When a new goal is created, its task ID counter is initialized, ensuring that top-level tasks for this goal will start with ID "1".
+   - Create a new goal
    - Parameters:
      ```typescript
      {
@@ -42,15 +46,16 @@ The server provides the following tools (based on `build/index.js`):
    - Returns: `{ goalId: number }`
 
 2. `add_tasks`
-   - Add multiple tasks to a goal.
+   - Add multiple tasks to a goal. Tasks can be provided in a hierarchical structure. For tasks that are children of *existing* tasks, use the `parentId` field. The operation is transactional: either all tasks in the batch succeed, or the entire operation fails.
    - Parameters:
      ```typescript
      {
-       goalId: number; // ID of the goal to add tasks to
+       goalId: number; // ID of the goal to add tasks to (number)
        tasks: Array<{
-         title: string; // Title of the task
-         description: string; // Detailed description of the task
-         parentId?: string; // Optional parent task ID for subtasks. Use null for top-level tasks. The `parentId` must be the ID of an *already existing* task in the database. In-batch parent task ID resolution (referencing a task being added in the same `add_tasks` call) is not supported.
+         title: string; // Title of the task (string)
+         description: string; // Detailed description of the task (string)
+         parentId?: string | null; // Optional parent task ID for tasks that are children of *existing* tasks. Do not use for new subtasks defined hierarchically within this batch.
+         subtasks?: Array<any>; // An array of nested subtask objects to be created under this task.
        }>;
      }
      ```
@@ -61,17 +66,23 @@ The server provides the following tools (based on `build/index.js`):
        "tasks": [
          {
            "title": "Design database schema",
-           "description": "Define tables for users, roles, and permissions"
+           "description": "Define tables for users, roles, and permissions",
+           "subtasks": [
+             {
+               "title": "Create ERD",
+               "description": "Draw entity-relationship diagram"
+             }
+           ]
          },
          {
            "title": "Implement user registration",
            "description": "Create API endpoint for new user signup",
-           "parentId": "1" // This "1" must refer to an already existing task with ID "1"
+           "parentId": "1"
          }
        ]
      }
      ```
-   - Returns: `{ addedTasks: TaskResponse[], totalTasksInDb: number }`. `TaskResponse` objects are simplified and do not include `createdAt`, `updatedAt`, or `parentId`.
+   - Returns: `HierarchicalTaskResponse[]`. `HierarchicalTaskResponse` objects are simplified and do not include `createdAt`, `updatedAt`, or `parentId`.
 
 3. `remove_tasks`
    - Soft-delete multiple tasks from a goal. Tasks are marked as deleted but remain in the system. By default, a parent task with subtasks cannot be soft-deleted without explicitly deleting its children. Soft-deleted tasks are excluded by default from `get_tasks` results unless `includeDeletedTasks` is set to true.
@@ -80,7 +91,7 @@ The server provides the following tools (based on `build/index.js`):
      {
        goalId: number; // ID of the goal to remove tasks from
        taskIds: string[]; // IDs of the tasks to remove (array of strings). Task IDs use dot-notation (e.g., "1", "1.1").
-       deleteChildren?: boolean; // Optional: Set to true to recursively soft-delete child tasks along with the parent. Defaults to false.
+       deleteChildren?: boolean; // Whether to delete child tasks along with the parent (boolean). Defaults to false. If false, attempting to delete a parent task with existing subtasks will throw an error.
      }
      ```
    - Sample Input (without deleting children):
@@ -101,13 +112,14 @@ The server provides the following tools (based on `build/index.js`):
    - Returns: `{ removedTasks: TaskResponse[], completedParents: TaskResponse[] }`. `TaskResponse` objects are simplified and do not include `createdAt`, `updatedAt`, or `parentId`.
 
 4. `get_tasks`
-   - Get tasks for a goal.
+   - Get tasks for a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). When `includeSubtasks` is specified, responses will return hierarchical task objects. Otherwise, simplified task objects without `createdAt`, `updatedAt`, or `parentId` will be returned.
    - Parameters:
      ```typescript
      {
-       goalId: number; // ID of the goal to get tasks for
+       goalId: number; // ID of the goal to get tasks for (number)
+       taskIds?: string[]; // Optional: IDs of tasks to fetch (array of strings). If null or empty, all tasks for the goal will be fetched.
        includeSubtasks?: "none" | "first-level" | "recursive"; // Level of subtasks to include: "none" (only top-level tasks), "first-level" (top-level tasks and their direct children), or "recursive" (all nested subtasks). Defaults to "none".
-       includeDeletedTasks?: boolean; // Optional: Whether to include soft-deleted tasks in the results. Defaults to false.
+       includeDeletedTasks?: boolean; // Whether to include soft-deleted tasks in the results (boolean). Defaults to false.
      }
      ```
    - Sample Input:
@@ -127,7 +139,7 @@ The server provides the following tools (based on `build/index.js`):
      {
        goalId: number; // ID of the goal containing the tasks
        taskIds: string[]; // IDs of the tasks to update (array of strings). Task IDs use dot-notation (e.g., "1", "1.1").
-       completeChildren?: boolean; // Optional: Set to true to recursively complete all child tasks when marking a parent task complete. Defaults to false.
+       completeChildren?: boolean; // Whether to complete all child tasks recursively (boolean). Defaults to false. If false, a task can only be completed if all its subtasks are already complete.
      }
      ```
    - Sample Input (without completing children):
@@ -145,7 +157,7 @@ The server provides the following tools (based on `build/index.js`):
        "completeChildren": true
      }
      ```
-   - Returns: `{ updatedTasks: TaskResponse[], completedParents: TaskResponse[] }`. `TaskResponse` objects are simplified and do not include `createdAt`, `updatedAt`, or `parentId`.
+   - Returns: `TaskResponse[]`. `TaskResponse` objects are simplified and do not include `createdAt`, `updatedAt`, or `parentId`.
 
 ## Usage Examples
 

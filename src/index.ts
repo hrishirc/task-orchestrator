@@ -9,7 +9,7 @@ import {
   Request,
 } from '@modelcontextprotocol/sdk/types.js';
 import { storage } from './storage';
-import { Goal, Task, TaskResponse } from './types';
+import { Goal, Task, TaskResponse, AddTasksInput, HierarchicalTaskResponse, TaskInput } from './types';
 
 export class SoftwarePlanningServer {
   private server: Server;
@@ -57,7 +57,7 @@ export class SoftwarePlanningServer {
         },
         {
           name: 'add_tasks',
-          description: 'Add multiple tasks to a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1") where each segment represents a level in the hierarchy. Top-level tasks have a null parentId. The `parentId` for a subtask must refer to the ID of an *already existing* task. In-batch parent task ID resolution is not supported. Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          description: 'Add multiple tasks to a goal. Tasks can be provided in a hierarchical structure. For tasks that are children of *existing* tasks, use the `parentId` field. The operation is transactional: either all tasks in the batch succeed, or the entire operation fails.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -67,30 +67,41 @@ export class SoftwarePlanningServer {
               },
               tasks: {
                 type: 'array',
-                description: 'An array of new task objects to be added. Each task object must include "title" (string) and "description" (string), and can optionally include "parentId" (string) to define subtasks. The `parentId` must be the ID of an *already existing* task. If `parentId` is null, it will be a top-level task.',
+                description: 'An array of task objects to be added. Each task can define nested subtasks.',
                 items: {
-                  type: 'object',
-                  description: 'A single task object. It has the following properties: "title" (string), "description" (string), and optionally "parentId" (string) for subtasks.',
-                  properties: {
-                    title: {
-                      type: 'string',
-                      description: 'Title of the task (string)',
-                    },
-                    description: {
-                      type: 'string',
-                      description: 'Detailed description of the task (string)',
-                    },
-                    parentId: {
-                      type: ['string', 'null'],
-                      description: 'Optional parent task ID for subtasks (string). Use null for top-level tasks. Must be the ID of an *already existing* task.',
-                    },
-                  },
-                  required: ['title', 'description'],
-                },
-              },
+                  $ref: '#/definitions/TaskInput'
+                }
+              }
             },
             required: ['goalId', 'tasks'],
-          },
+            definitions: {
+              TaskInput: {
+                type: 'object',
+                properties: {
+                  title: {
+                    type: 'string',
+                    description: 'Title of the task (string)'
+                  },
+                  description: {
+                    type: 'string',
+                    description: 'Detailed description of the task (string)'
+                  },
+                  parentId: {
+                    type: ['string', 'null'],
+                    description: 'Optional parent task ID for tasks that are children of *existing* tasks. Do not use for new subtasks defined hierarchically within this batch.'
+                  },
+                  subtasks: {
+                    type: 'array',
+                    description: 'An array of nested subtask objects to be created under this task.',
+                    items: {
+                      $ref: '#/definitions/TaskInput'
+                    }
+                  }
+                },
+                required: ['title', 'description']
+              }
+            }
+          }
         },
         {
           name: 'remove_tasks',
@@ -120,13 +131,20 @@ export class SoftwarePlanningServer {
         },
         {
           name: 'get_tasks',
-          description: 'Get tasks for a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          description: 'Get tasks for a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). When `includeSubtasks` is specified, responses will return hierarchical task objects. Otherwise, simplified task objects without `createdAt`, `updatedAt`, or `parentId` will be returned.',
           inputSchema: {
             type: 'object',
             properties: {
               goalId: {
                 type: 'number',
                 description: 'ID of the goal to get tasks for (number)',
+              },
+              taskIds: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Optional: IDs of tasks to fetch (array of strings). If null or empty, all tasks for the goal will be fetched.',
               },
               includeSubtasks: {
                 type: 'string',
@@ -195,47 +213,68 @@ export class SoftwarePlanningServer {
         }
 
         case 'add_tasks': {
-          const { goalId, tasks } = request.params.arguments as {
-            goalId: number;
-            tasks: Array<Omit<Task, 'id' | 'goalId' | 'isComplete' | 'createdAt' | 'updatedAt'>>;
-          };
+          const { goalId, tasks: taskInputs } = request.params.arguments as AddTasksInput;
 
-          const addedTasks: TaskResponse[] = [];
-          // ParentId must refer to an already existing task in the database.
-          // In-batch parentId resolution is not supported with the current input schema.
+          const createdTasks: HierarchicalTaskResponse[] = [];
 
-          const existingTasks = await storage.getTasks(goalId, 'recursive', true);
-          const existingIdSet = new Set<string>(existingTasks.map(t => t.id));
-
-          for (const task of tasks) {
-            let resolvedParentId: string | null = null;
-            if (task.parentId !== null) {
-              if (existingIdSet.has(task.parentId)) {
-                resolvedParentId = task.parentId;
-              } else {
-                throw new McpError(ErrorCode.InvalidParams, `Parent task with ID "${task.parentId}" not found.`);
+          // Helper function to recursively process tasks
+          const processTaskInputRecursively = async (
+            taskInput: TaskInput,
+            currentGoalId: number,
+            parentTaskId: string | null
+          ): Promise<HierarchicalTaskResponse> => {
+            // Validate parentId if it refers to an existing task
+            if (taskInput.parentId !== undefined && taskInput.parentId !== null) {
+              // Use getTasks to check for existing parent, passing the parentId as an array
+              const existingTasks = await storage.getTasks(currentGoalId, [taskInput.parentId]);
+              if (!existingTasks || existingTasks.length === 0) {
+                throw new McpError(ErrorCode.InvalidParams, `Parent task with ID "${taskInput.parentId}" not found for goal ${currentGoalId}.`);
               }
             }
 
-            const newTask = await storage.addTask(goalId, {
-              title: task.title,
-              description: task.description,
-              parentId: resolvedParentId,
-              // The 'deleted' property is required by the Omit<Task, ...> type in storage.addTask
-              deleted: false, 
+            // Add the current task
+            const newTask = await storage.addTask(currentGoalId, {
+              title: taskInput.title,
+              description: taskInput.description,
+              parentId: parentTaskId, // Use the parentTaskId from recursion, not taskInput.parentId
+              deleted: false,
             });
-            addedTasks.push(newTask);
-          }
 
-          // No need to call storage.initialize() here, it's done in the constructor/start
-          const allTasksInDb = await storage.getTasks(goalId, 'recursive');
-          const totalTasksInDb = allTasksInDb.length;
+            const hierarchicalTaskResponse: HierarchicalTaskResponse = {
+              id: newTask.id,
+              goalId: newTask.goalId,
+              title: newTask.title,
+              description: newTask.description,
+              isComplete: newTask.isComplete,
+              deleted: newTask.deleted,
+            };
+
+            // Recursively add subtasks
+            if (taskInput.subtasks && taskInput.subtasks.length > 0) {
+              hierarchicalTaskResponse.subtasks = [];
+              for (const subtaskInput of taskInput.subtasks) {
+                const subtaskResult = await processTaskInputRecursively(
+                  subtaskInput,
+                  currentGoalId,
+                  newTask.id // New task's ID becomes the parent for its subtasks
+                );
+                hierarchicalTaskResponse.subtasks.push(subtaskResult);
+              }
+            }
+            return hierarchicalTaskResponse;
+          };
+
+          // Process top-level tasks
+          for (const taskInput of taskInputs) {
+            const createdTask = await processTaskInputRecursively(taskInput, goalId, taskInput.parentId || null);
+            createdTasks.push(createdTask);
+          }
 
           return {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify({ addedTasks, totalTasksInDb }, null, 2),
+                text: JSON.stringify(createdTasks, null, 2),
               },
             ],
           };
@@ -257,14 +296,27 @@ export class SoftwarePlanningServer {
         }
 
         case 'get_tasks': {
-          const { goalId, includeSubtasks = 'none', includeDeletedTasks = false } = request.params.arguments as { 
+          const { goalId, taskIds, includeSubtasks = 'none', includeDeletedTasks = false } = request.params.arguments as { 
             goalId: number; 
+            taskIds?: string[];
             includeSubtasks?: 'none' | 'first-level' | 'recursive';
             includeDeletedTasks?: boolean;
           };
-          // No need to call storage.initialize() here
-          const tasks = await storage.getTasks(goalId, includeSubtasks, includeDeletedTasks);
-          const textContent = JSON.stringify(tasks, null, 2);
+
+          // If taskIds are provided, fetch specific tasks. Otherwise, fetch all tasks for the goal.
+          const fetchedTasks: TaskResponse[] = await storage.getTasks(goalId, taskIds && taskIds.length > 0 ? taskIds : undefined, includeSubtasks, includeDeletedTasks);
+          
+          // Map Task objects to TaskResponse objects to match the schema description
+          const taskResponses: TaskResponse[] = fetchedTasks.map(task => ({
+            id: task.id,
+            goalId: task.goalId,
+            title: task.title,
+            description: task.description,
+            isComplete: task.isComplete,
+            deleted: task.deleted,
+          }));
+
+          const textContent = JSON.stringify(taskResponses, null, 2);
           return {
             content: [
               {
