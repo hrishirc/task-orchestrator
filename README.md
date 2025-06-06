@@ -12,6 +12,7 @@ A Model Context Protocol (MCP) server for task orchestration and management. Thi
 
 ## Roadmap 
 --- Complex task/goal inter-dependency orchestration
+
 --- Goal deletion
 
 ## API Reference
