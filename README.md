@@ -11,9 +11,10 @@ A Model Context Protocol (MCP) server for task orchestration and management. Thi
 - Persistent storage using LokiDB
 
 ## Roadmap 
---- Complex task/goal inter-dependency orchestration
-
---- Goal deletion
+- Complex task/goal inter-dependency orchestration
+- Goal deletion
+- Completion dispositions
+- UI for visualization of progress
 
 ## API Reference
 
