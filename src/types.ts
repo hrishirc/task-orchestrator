@@ -7,6 +7,7 @@ export interface Task {
   isComplete: boolean;
   createdAt: string;
   updatedAt: string;
+  deleted: boolean;
 }
 
 export interface TaskResponse {
@@ -15,6 +16,7 @@ export interface TaskResponse {
   title: string;
   description: string;
   isComplete: boolean;
+  deleted: boolean;
 }
 
 export interface Goal {

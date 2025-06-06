@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { SoftwarePlanningServer } from '../index.js';
 import { Storage } from '../storage.js';
-import { Goal, Task } from '../types.js';
+import { Goal, Task, TaskResponse } from '../types.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -125,6 +125,7 @@ describe('SoftwarePlanningServer', () => {
         isComplete: false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        deleted: false, // Added deleted property
       };
 
       // Mock getTasks to return an empty array initially, then the added task for totalTasksInDb count
@@ -159,66 +160,21 @@ describe('SoftwarePlanningServer', () => {
       });
     });
 
-    it('should handle add_tasks tool with parentId referring to a task in the same batch', async () => {
-      const mockTask1: Task = {
-        id: "1",
-        goalId: 1,
-        title: 'Parent task',
-        description: 'Parent description',
-        parentId: null,
-        isComplete: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      const mockTask2: Task = {
-        id: "1.1",
-        goalId: 1,
-        title: 'Child task',
-        description: 'Child description',
-        parentId: "1", // Parent ID refers to task 1
-        isComplete: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      mockStorage.getTasks.mockResolvedValueOnce([]); // Initial empty tasks
-      mockStorage.addTask
-        .mockResolvedValueOnce(mockTask1)
-        .mockResolvedValueOnce(mockTask2);
-      mockStorage.initialize.mockResolvedValue(undefined);
-      mockStorage.getTasks.mockResolvedValueOnce([mockTask1, mockTask2]); // After adding
-
-      const result = await callToolHandler({
+    it('should handle add_tasks tool with parentId referring to a non-existent task (in-batch or existing)', async () => {
+      mockStorage.getTasks.mockResolvedValueOnce([]); // No existing tasks
+      
+      // Expect an error because 'NonExistentParent' does not exist
+      await expect(callToolHandler({
         params: {
           name: 'add_tasks',
           arguments: {
             goalId: 1,
             tasks: [
-              { title: 'Parent task', description: 'Parent description', parentId: null },
-              { title: 'Child task', description: 'Child description', parentId: 'Parent task' }, // Referencing by title
+              { title: 'Child task', description: 'Child description', parentId: 'NonExistentParent' },
             ],
           },
         },
-      });
-
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ addedTasks: [mockTask1, mockTask2], totalTasksInDb: 2 }, null, 2),
-          },
-        ],
-      });
-      expect(mockStorage.addTask).toHaveBeenCalledWith(1, {
-        title: 'Parent task',
-        description: 'Parent description',
-        parentId: null,
-      });
-      expect(mockStorage.addTask).toHaveBeenCalledWith(1, {
-        title: 'Child task',
-        description: 'Child description',
-        parentId: '1', // Should be resolved to the ID of 'Parent task'
-      });
+      })).rejects.toThrow('Parent task with ID "NonExistentParent" not found.');
     });
 
     it('should handle add_tasks tool with parentId referring to an already existing task', async () => {
@@ -231,22 +187,20 @@ describe('SoftwarePlanningServer', () => {
         isComplete: false,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        deleted: false,
       };
-      const newTask: Task = {
+      const newTaskResponse: TaskResponse = { // Use TaskResponse for mock
         id: "10.1",
         goalId: 1,
         title: 'New Child',
         description: 'New child description',
-        parentId: "10",
         isComplete: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        deleted: false,
       };
 
       mockStorage.getTasks.mockResolvedValueOnce([existingTask]); // Simulate existing tasks
-      mockStorage.addTask.mockResolvedValueOnce(newTask);
-      mockStorage.initialize.mockResolvedValue(undefined);
-      mockStorage.getTasks.mockResolvedValueOnce([existingTask, newTask]); // After adding
+      mockStorage.addTask.mockResolvedValueOnce(newTaskResponse); // Mock with TaskResponse
+      mockStorage.getTasks.mockResolvedValueOnce([existingTask, newTaskResponse]); // After adding
 
       const result = await callToolHandler({
         params: {
@@ -254,7 +208,7 @@ describe('SoftwarePlanningServer', () => {
           arguments: {
             goalId: 1,
             tasks: [
-              { title: 'New Child', description: 'New child description', parentId: 'Existing Parent' },
+              { title: 'New Child', description: 'New child description', parentId: '10' }, // Referencing by ID
             ],
           },
         },
@@ -264,35 +218,23 @@ describe('SoftwarePlanningServer', () => {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ addedTasks: [newTask], totalTasksInDb: 2 }, null, 2),
+            text: JSON.stringify({ addedTasks: [newTaskResponse], totalTasksInDb: 2 }, null, 2),
           },
         ],
       });
       expect(mockStorage.addTask).toHaveBeenCalledWith(1, {
         title: 'New Child',
         description: 'New child description',
-        parentId: '10', // Should be resolved to the ID of 'Existing Parent'
+        parentId: '10',
+        deleted: false, // Ensure this is passed
       });
     });
 
     it('should handle add_tasks tool with parentId that does not exist', async () => {
-      const newTask: Task = {
-        id: "1",
-        goalId: 1,
-        title: 'Top-level task',
-        description: 'Description',
-        parentId: null, // Should resolve to null
-        isComplete: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
       mockStorage.getTasks.mockResolvedValueOnce([]); // No existing tasks
-      mockStorage.addTask.mockResolvedValueOnce(newTask);
-      mockStorage.initialize.mockResolvedValue(undefined);
-      mockStorage.getTasks.mockResolvedValueOnce([newTask]);
-
-      const result = await callToolHandler({
+      
+      // Expect an error because 'NonExistentParent' does not exist
+      await expect(callToolHandler({
         params: {
           name: 'add_tasks',
           arguments: {
@@ -302,21 +244,7 @@ describe('SoftwarePlanningServer', () => {
             ],
           },
         },
-      });
-
-      expect(result).toEqual({
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ addedTasks: [newTask], totalTasksInDb: 1 }, null, 2),
-          },
-        ],
-      });
-      expect(mockStorage.addTask).toHaveBeenCalledWith(1, {
-        title: 'Top-level task',
-        description: 'Description',
-        parentId: null, // Should be resolved to null
-      });
+      })).rejects.toThrow('Parent task with ID "NonExistentParent" not found.');
     });
 
     it('should handle remove_tasks tool', async () => {
@@ -326,6 +254,7 @@ describe('SoftwarePlanningServer', () => {
             id: "1", // Changed to string
             goalId: 1,
             title: 'Test task',
+            deleted: true, // Added deleted property
           },
         ],
         completedParents: [],
@@ -355,24 +284,26 @@ describe('SoftwarePlanningServer', () => {
     });
 
     it('should handle get_tasks tool', async () => {
-      const mockTasks = [
+      const mockTasksResponse: TaskResponse[] = [
         {
-          id: "1", // Changed to string
+          id: "1",
           goalId: 1,
           title: 'Test task',
-          parentId: null,
+          description: 'Test description', // Added description for TaskResponse
+          isComplete: false, // Added isComplete for TaskResponse
+          deleted: false,
         },
       ];
 
-      mockStorage.getTasks.mockResolvedValue(mockTasks);
-      mockStorage.initialize.mockResolvedValue(undefined); // Mock initialize
+      mockStorage.getTasks.mockResolvedValue(mockTasksResponse);
 
       const result = await callToolHandler({
         params: {
           name: 'get_tasks',
           arguments: {
             goalId: 1,
-            includeSubtasks: "recursive", // Changed to string literal
+            includeSubtasks: "recursive",
+            includeDeletedTasks: true,
           },
         },
       });
@@ -381,7 +312,7 @@ describe('SoftwarePlanningServer', () => {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(mockTasks, null, 2),
+            text: JSON.stringify(mockTasksResponse, null, 2),
           },
         ],
       });
@@ -395,6 +326,7 @@ describe('SoftwarePlanningServer', () => {
             goalId: 1,
             title: 'Test task',
             isComplete: true,
+            deleted: false, // Added deleted property
           },
         ],
         completedParents: [],
@@ -430,16 +362,14 @@ describe('SoftwarePlanningServer', () => {
     });
   });
 
-  it('handles server startup errors', async () => {
-    const mockServer = {
-      listen: vi.fn().mockRejectedValue(new Error('Port in use')),
-      close: vi.fn()
-    };
-    const mockCreateServer = vi.fn().mockReturnValue(mockServer);
-    vi.stubGlobal('createServer', mockCreateServer);
+  it('should call onerror callback when server encounters an error', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    
+    // Simulate an error being triggered by the server
+    const testError = new Error('Simulated server error');
+    mockServer.onerror(testError);
 
-    const server = new SoftwarePlanningServer();
-    const result = await server.start();
-    expect(result).toBeUndefined();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('[MCP Error]', testError);
+    consoleErrorSpy.mockRestore();
   });
 });

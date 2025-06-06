@@ -51,13 +51,59 @@ describe('Storage', () => {
     }
   });
 
-  describe('initialize', () => {
+  describe('Storage Constructor and Initialization', () => {
+    const tempDir = path.join(__dirname, 'temp_db_tests');
+    const tempDbPath = path.join(tempDir, 'temp_test.db');
+
+    beforeEach(() => {
+      // Clean up temp directory before each test
+      if (fs.existsSync(tempDir)) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    afterEach(() => {
+      // Clean up temp directory after each test
+      if (fs.existsSync(tempDir)) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+      // Clear the environment variable if it was set
+      delete process.env.MCP_DB_PATH;
+    });
+
+    it('should create the database directory if it does not exist', async () => {
+      const newStorage = new Storage(tempDbPath);
+      await newStorage.initialize();
+      expect(fs.existsSync(tempDir)).toBe(true);
+      await new Promise<void>((resolve) => {
+        (newStorage as any).db.close(() => resolve());
+      });
+    });
+
+    it('should use the provided dbPath', async () => {
+      const newStorage = new Storage(tempDbPath);
+      await newStorage.initialize();
+      expect((newStorage as any).db.filename).toBe(tempDbPath);
+      await new Promise<void>((resolve) => {
+        (newStorage as any).db.close(() => resolve());
+      });
+    });
+
+    it('should use MCP_DB_PATH environment variable if set', async () => {
+      process.env.MCP_DB_PATH = tempDbPath;
+      const newStorage = new Storage(); // No path provided, should use env var
+      await newStorage.initialize();
+      expect((newStorage as any).db.filename).toBe(tempDbPath);
+      await new Promise<void>((resolve) => {
+        (newStorage as any).db.close(() => resolve());
+      });
+    });
+
     it('should load the database', async () => {
       await storage.initialize();
       // If no error is thrown, the test passes
       expect(true).toBe(true);
     });
-
 
     it('should initialize nextTaskId if missing from metadata', async () => {
       // Clear metadata and insert an object without nextTaskId
@@ -149,6 +195,7 @@ describe('Storage', () => {
         title: 'Test task',
         description: 'Test description',
         parentId: null,
+        deleted: false,
       };
       const task = await storage.addTask(goal.id, taskData);
       expect(task).toMatchObject({
@@ -157,7 +204,27 @@ describe('Storage', () => {
         title: taskData.title,
         description: taskData.description,
         isComplete: false,
+        deleted: false, // New expectation
       });
+    });
+
+    it('should add a task with an existing parent ID', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent Task', description: '', parentId: null, deleted: false });
+      const childTask = await storage.addTask(goal.id, { title: 'Child Task', description: '', parentId: parentTask.id, deleted: false });
+
+      expect(childTask.id).toBe(`${parentTask.id}.1`);
+      expect(childTask.goalId).toBe(goal.id);
+      expect(childTask.title).toBe('Child Task');
+    });
+
+    it('should throw error if parentId does not exist', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      await expect(
+        storage.addTask(goal.id, { title: 'Orphan Task', description: '', parentId: 'NonExistentParent', deleted: false })
+      ).rejects.toThrow('Parent task with ID "NonExistentParent" not found for goal 1.');
     });
 
     it('should throw error if plan not found', async () => {
@@ -166,6 +233,7 @@ describe('Storage', () => {
           title: 'Test task',
           description: 'Test description',
           parentId: null,
+          deleted: false,
         })
       ).rejects.toThrow('No plan found for goal 1');
     });
@@ -185,6 +253,7 @@ describe('Storage', () => {
           title: 'Task without metadata',
           description: 'This task should fail due to missing metadata',
           parentId: null,
+          deleted: false,
         })
       ).rejects.toThrow('Metadata collection not found or empty.');
 
@@ -193,37 +262,119 @@ describe('Storage', () => {
     });
   });
 
-  describe('updateTasksStatus', () => {
+  describe('updateParentTaskStatus (private method)', () => {
+    let goalId: number;
+    let parentTask: any;
+    let child1: any;
+    let child2: any;
+    let deletedChild: any;
+
+    beforeEach(async () => {
+      const goal = await storage.createGoal('Test Goal for Parent Status', 'https://github.com/test/parentstatus');
+      await storage.createPlan(goal.id);
+      goalId = goal.id;
+
+      const parentTaskResponse = await storage.addTask(goalId, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const child1Response = await storage.addTask(goalId, { title: 'Child 1', description: '', parentId: parentTaskResponse.id, deleted: false });
+      const child2Response = await storage.addTask(goalId, { title: 'Child 2', description: '', parentId: parentTaskResponse.id, deleted: false });
+      const deletedChildResponse = await storage.addTask(goalId, { title: 'Deleted Child', description: '', parentId: parentTaskResponse.id, deleted: false });
+      
+      // Soft delete one child
+      await storage.removeTasks(goalId, [deletedChildResponse.id]);
+
+      // Retrieve the actual LokiJS documents for manipulation in tests
+      parentTask = (storage as any).tasks.findOne({ id: parentTaskResponse.id });
+      child1 = (storage as any).tasks.findOne({ id: child1Response.id });
+      child2 = (storage as any).tasks.findOne({ id: child2Response.id });
+      deletedChild = (storage as any).tasks.findOne({ id: deletedChildResponse.id });
+    });
+
+    it('should make parent incomplete if a non-deleted child becomes incomplete', async () => {
+      // Mark all non-deleted children complete first
+      // We need to re-fetch the children to ensure they are the latest LokiJS documents
+      const currentChild1 = (storage as any).tasks.findOne({ id: child1.id });
+      const currentChild2 = (storage as any).tasks.findOne({ id: child2.id });
+      await storage.completeTasksStatus(goalId, [currentChild1.id, currentChild2.id]);
+      
+      let currentParent = (storage as any).tasks.findOne({ id: parentTask.id });
+      expect(currentParent.isComplete).toBe(true);
+
+      // Now mark one non-deleted child incomplete
+      const child1ToUpdate = (storage as any).tasks.findOne({ id: child1.id });
+      child1ToUpdate.isComplete = false;
+      (storage as any).tasks.update(child1ToUpdate);
+      await (storage as any).save(); // Save changes to trigger updateParentTaskStatus
+
+      const updatedParent = await (storage as any).updateParentTaskStatus(goalId, parentTask.id);
+      expect(updatedParent).toMatchObject({ id: parentTask.id, isComplete: false });
+    });
+
+    it('should keep parent complete if a deleted child becomes incomplete', async () => {
+      // Mark all non-deleted children complete
+      const currentChild1 = (storage as any).tasks.findOne({ id: child1.id });
+      const currentChild2 = (storage as any).tasks.findOne({ id: child2.id });
+      await storage.completeTasksStatus(goalId, [currentChild1.id, currentChild2.id]);
+      
+      let currentParent = (storage as any).tasks.findOne({ id: parentTask.id });
+      expect(currentParent.isComplete).toBe(true);
+
+      // Mark the deleted child incomplete (should not affect parent)
+      const deletedChildToUpdate = (storage as any).tasks.findOne({ id: deletedChild.id });
+      deletedChildToUpdate.isComplete = false;
+      (storage as any).tasks.update(deletedChildToUpdate);
+      await (storage as any).save();
+
+      const updatedParent = await (storage as any).updateParentTaskStatus(goalId, parentTask.id);
+      expect(updatedParent).toBeNull(); // No change to parent status
+      currentParent = (storage as any).tasks.findOne({ id: parentTask.id });
+      expect(currentParent.isComplete).toBe(true);
+    });
+
+    it('should keep parent incomplete if not all non-deleted children are complete', async () => {
+      // Parent is initially incomplete
+      let currentParent = (storage as any).tasks.findOne({ id: parentTask.id });
+      expect(currentParent.isComplete).toBe(false);
+
+      // Mark only one child complete
+      await storage.completeTasksStatus(goalId, [child1.id]);
+
+      const updatedParent = await (storage as any).updateParentTaskStatus(goalId, parentTask.id);
+      expect(updatedParent).toBeNull(); // No change to parent status
+      currentParent = (storage as any).tasks.findOne({ id: parentTask.id });
+      expect(currentParent.isComplete).toBe(false);
+    });
+  });
+
+  describe('completeTasksStatus', () => {
     it('should update task status and parent task if needed', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const childTask = await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parentTask.id });
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const childTask = await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parentTask.id, deleted: false });
       const result = await storage.completeTasksStatus(goal.id, [childTask.id]);
       expect(result.updatedTasks.length).toBe(1);
     });
 
-
-    it('should not complete parent if children are incomplete and completeChildren is false', async () => {
+    it('should not complete parent if non-deleted children are incomplete and completeChildren is false', async () => {
       const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const child1 = await storage.addTask(goal.id, { title: 'Child 1', description: '', parentId: parentTask.id });
-      const child2 = await storage.addTask(goal.id, { title: 'Child 2', description: '', parentId: parentTask.id });
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const child1 = await storage.addTask(goal.id, { title: 'Child 1', description: '', parentId: parentTask.id, deleted: false });
+      const child2 = await storage.addTask(goal.id, { title: 'Child 2', description: '', parentId: parentTask.id, deleted: false });
       
       // Mark child2 complete
       await storage.completeTasksStatus(goal.id, [child2.id]);
 
-      // Try to mark parent complete without completing all children
+      // Try to mark parent complete without completing all non-deleted children
       const result = await storage.completeTasksStatus(goal.id, [parentTask.id], false);
       expect(result.updatedTasks).toHaveLength(0); // Parent should not be updated
       const updatedParent = await storage.getTasks(goal.id, 'none');
       expect(updatedParent.find(t => t.id === parentTask.id)?.isComplete).toBe(false);
 
       expect(consoleWarnSpy).toHaveBeenCalledWith(
-        `Task ${parentTask.id} cannot be marked complete because not all its subtasks are complete.`
+        `Task ${parentTask.id} cannot be marked complete because not all its non-deleted subtasks are complete.`
       );
       consoleWarnSpy.mockRestore();
     });
@@ -231,10 +382,10 @@ describe('Storage', () => {
     it('should complete parent and all children recursively when completeChildren is true', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const child1 = await storage.addTask(goal.id, { title: 'Child 1', description: '', parentId: parentTask.id });
-      const child2 = await storage.addTask(goal.id, { title: 'Child 2', description: '', parentId: parentTask.id });
-      const grandChild = await storage.addTask(goal.id, { title: 'Grandchild', description: '', parentId: child1.id });
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const child1 = await storage.addTask(goal.id, { title: 'Child 1', description: '', parentId: parentTask.id, deleted: false });
+      const child2 = await storage.addTask(goal.id, { title: 'Child 2', description: '', parentId: parentTask.id, deleted: false });
+      const grandChild = await storage.addTask(goal.id, { title: 'Grandchild', description: '', parentId: child1.id, deleted: false });
 
       // Mark parent complete with completeChildren: true
       const result = await storage.completeTasksStatus(goal.id, [parentTask.id], true);
@@ -249,133 +400,234 @@ describe('Storage', () => {
       expect(allTasks.find(t => t.id === grandChild.id)?.isComplete).toBe(true);
     });
 
+    it('should not update task status if already complete', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const task = await storage.addTask(goal.id, { title: 'Already Complete', description: '', parentId: null, deleted: false });
+      await storage.completeTasksStatus(goal.id, [task.id]); // Mark complete once
+
+      const result = await storage.completeTasksStatus(goal.id, [task.id]); // Try to mark complete again
+      expect(result.updatedTasks).toHaveLength(0); // Should not be updated again
+    });
+
+    it('should ignore deleted children when determining completion status', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const child1 = await storage.addTask(goal.id, { title: 'Child 1', description: '', parentId: parentTask.id, deleted: false });
+      const deletedChild = await storage.addTask(goal.id, { title: 'Deleted Child', description: '', parentId: parentTask.id, deleted: false });
+      
+      await storage.removeTasks(goal.id, [deletedChild.id]); // Soft delete one child
+
+      // Complete the only non-deleted child
+      const result = await storage.completeTasksStatus(goal.id, [child1.id]);
+      expect(result.updatedTasks).toHaveLength(1); // Child1 updated
+      expect(result.completedParents).toHaveLength(1); // Parent updated
+
+      const updatedParent = await storage.getTasks(goal.id, 'none');
+      expect(updatedParent.find(t => t.id === parentTask.id)?.isComplete).toBe(true);
+    });
+
     it('should throw error if plan not found', async () => {
       await expect(storage.completeTasksStatus(999, ['999'])).rejects.toThrow('No plan found for goal 999');
     });
   });
 
-  describe('removeTasks', () => {
-    it('should prevent deleting parent task with children without deleteChildren flag', async () => {
+  describe('removeTasks (soft delete)', () => {
+    it('should prevent soft deleting parent task with children without deleteChildren flag', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parentTask.id });
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parentTask.id, deleted: false });
 
       await expect(storage.removeTasks(goal.id, [parentTask.id], false)).rejects.toThrow(
         `Task ${parentTask.id} has subtasks and cannot be deleted without explicitly setting 'deleteChildren' to true.`
       );
     });
 
-    it('should remove tasks and their subtasks', async () => {
+    it('should soft delete a single top-level task', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const subTask = await storage.addTask(goal.id, { title: 'Sub', description: '', parentId: parentTask.id });
-      const result = await storage.removeTasks(goal.id, [parentTask.id], true); // Added deleteChildren: true
-      expect(result.removedTasks.length).toBe(2);
-      expect(result.removedTasks.find(t => t.id === parentTask.id)).toBeTruthy();
-      expect(result.removedTasks.find(t => t.id === subTask.id)).toBeTruthy();
+      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false });
+
+      const result = await storage.removeTasks(goal.id, [task1.id]);
+      expect(result.removedTasks.length).toBe(1);
+      expect(result.removedTasks[0].id).toBe(task1.id);
+      expect(result.removedTasks[0].deleted).toBe(true);
+
+      const allTasksInDb = (storage as any).tasks.find({ goalId: goal.id });
+      expect(allTasksInDb.find((t: any) => t.id === task1.id)?.deleted).toBe(true);
+      const nonDeletedTasks = await storage.getTasks(goal.id, 'recursive');
+      expect(nonDeletedTasks).toHaveLength(0);
     });
+
+    it('should soft delete a subtask', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const subTask = await storage.addTask(goal.id, { title: 'Sub', description: '', parentId: parentTask.id, deleted: false });
+
+      const result = await storage.removeTasks(goal.id, [subTask.id]);
+      expect(result.removedTasks.length).toBe(1);
+      expect(result.removedTasks[0].id).toBe(subTask.id);
+      expect(result.removedTasks[0].deleted).toBe(true);
+
+      const allTasksInDb = (storage as any).tasks.find({ goalId: goal.id });
+      expect(allTasksInDb.find((t: any) => t.id === subTask.id)?.deleted).toBe(true);
+      const nonDeletedTasks = await storage.getTasks(goal.id, 'recursive');
+      expect(nonDeletedTasks).toHaveLength(1); // Parent should still be there
+      expect(nonDeletedTasks[0].id).toBe(parentTask.id);
+    });
+
+    it('should soft delete a parent task and all its subtasks recursively when deleteChildren is true', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const childTask = await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parentTask.id, deleted: false });
+      const grandChild = await storage.addTask(goal.id, { title: 'Grandchild', description: '', parentId: childTask.id, deleted: false });
+
+      const result = await storage.removeTasks(goal.id, [parentTask.id], true);
+      
+      expect(result.removedTasks.length).toBe(3);
+      expect(result.removedTasks.find(t => t.id === parentTask.id)).toMatchObject({ deleted: true });
+      expect(result.removedTasks.find(t => t.id === childTask.id)).toMatchObject({ deleted: true });
+      expect(result.removedTasks.find(t => t.id === grandChild.id)).toMatchObject({ deleted: true });
+
+      const allTasksInDb = (storage as any).tasks.find({ goalId: goal.id });
+      expect(allTasksInDb.find((t: any) => t.id === parentTask.id)?.deleted).toBe(true);
+      expect(allTasksInDb.find((t: any) => t.id === childTask.id)?.deleted).toBe(true);
+      expect(allTasksInDb.find((t: any) => t.id === grandChild.id)?.deleted).toBe(true);
+
+      const nonDeletedTasks = await storage.getTasks(goal.id, 'recursive');
+      expect(nonDeletedTasks).toHaveLength(0);
+    });
+
     it('should throw error if plan not found', async () => {
       await expect(storage.removeTasks(999, ['999'])).rejects.toThrow('No plan found for goal 999');
     });
 
-    it('should correctly sort taskIds before removal to ensure proper processing order', async () => {
-      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+    it('should not reorder task IDs after soft deletion', async () => {
+      const goal = await storage.createGoal('Test Goal for Soft Delete', 'https://github.com/test/softdelete');
       await storage.createPlan(goal.id);
-      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null }); // id: "1"
-      const task1_1 = await storage.addTask(goal.id, { title: 'Task 1.1', description: '', parentId: task1.id }); // id: "1.1"
-      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null }); // id: "2"
-      const task1_2 = await storage.addTask(goal.id, { title: 'Task 1.2', description: '', parentId: task1.id }); // id: "1.2"
 
-      // Attempt to remove tasks in an unsorted order
-      const taskIdsToRemove = [task1_2.id, task1.id, task2.id, task1_1.id];
+      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false }); // id: "1"
+      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null, deleted: false }); // id: "2"
+      const task3 = await storage.addTask(goal.id, { title: 'Task 3', description: '', parentId: null, deleted: false }); // id: "3"
 
-      // Mock the internal removeTaskAndSubtasks to verify call order if possible,
-      // or simply check the final state after removal.
-      // For now, we'll rely on the fact that if the test passes, the sorting worked.
-      const result = await storage.removeTasks(goal.id, taskIdsToRemove, true);
+      await storage.removeTasks(goal.id, [task2.id]); // Soft delete Task 2
 
-      expect(result.removedTasks.length).toBe(4);
-      expect(result.removedTasks.map(t => t.id).sort()).toEqual([task1.id, task1_1.id, task1_2.id, task2.id].sort());
+      // Verify IDs remain constant
+      const allTasks = await storage.getTasks(goal.id, 'recursive', true); // Get all tasks including deleted
+      expect(allTasks.length).toBe(3);
+      expect(allTasks.find(t => t.id === '1')?.title).toBe('Task 1');
+      expect(allTasks.find(t => t.id === '2')?.title).toBe('Task 2');
+      expect(allTasks.find(t => t.id === '2')?.deleted).toBe(true);
+      expect(allTasks.find(t => t.id === '3')?.title).toBe('Task 3');
 
-      const remainingTasks = await storage.getTasks(goal.id, 'recursive');
-      expect(remainingTasks).toHaveLength(0);
+      // Verify non-deleted tasks are returned correctly
+      const nonDeletedTasks = await storage.getTasks(goal.id, 'recursive', false);
+      expect(nonDeletedTasks.length).toBe(2);
+      expect(nonDeletedTasks[0].id).toBe('1');
+      expect(nonDeletedTasks[1].id).toBe('3');
     });
 
-    it('should throw error if metadata collection not found when removing tasks', async () => {
-      // Create a goal and plan, and some tasks first, before mocking
-      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
-      await storage.createPlan(goal.id);
-      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null });
-
-      // Temporarily mock getCollection to return null for 'metadata'
-      const metadataCollection = (storage as any).db.getCollection('metadata');
-      const originalFindOne = metadataCollection.findOne;
-      metadataCollection.findOne = vi.fn(() => null);
-
-      await expect(
-        storage.removeTasks(goal.id, [task1.id])
-      ).rejects.toThrow('Metadata collection not found or empty.');
-
-      // Restore original findOne
-      metadataCollection.findOne = originalFindOne;
-    });
   });
 
   describe('getTasks', () => {
-    it('should return tasks without subtasks', async () => {
+    it('should return tasks without subtasks (excluding deleted by default)', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null });
-      await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null });
+      await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false });
+      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null, deleted: false });
+      await storage.removeTasks(goal.id, [task2.id]); // Soft delete task 2
+
       const tasks = await storage.getTasks(goal.id, 'none');
-      expect(tasks.length).toBe(2);
+      expect(tasks.length).toBe(1);
       expect(tasks[0].id).toBe('1');
-      expect(tasks[1].id).toBe('2');
+      expect(tasks[0].title).toBe('Task 1');
     });
 
-    it('should return tasks with first-level subtasks', async () => {
+    it('should return tasks with first-level subtasks (excluding deleted by default)', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const subTask = await storage.addTask(goal.id, { title: 'Sub', description: '', parentId: parentTask.id });
+      const parentTask = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const subTask1 = await storage.addTask(goal.id, { title: 'Sub 1', description: '', parentId: parentTask.id, deleted: false });
+      const subTask2 = await storage.addTask(goal.id, { title: 'Sub 2', description: '', parentId: parentTask.id, deleted: false });
+      await storage.removeTasks(goal.id, [subTask2.id]); // Soft delete subTask2
+
       const tasks = await storage.getTasks(goal.id, 'first-level');
-      expect(tasks.length).toBe(2);
+      expect(tasks.length).toBe(2); // Parent and Sub 1
       expect(tasks.find(t => t.id === parentTask.id)).toBeDefined();
-      expect(tasks.find(t => t.id === subTask.id)).toBeDefined();
+      expect(tasks.find(t => t.id === subTask1.id)).toBeDefined();
+      expect(tasks.find(t => t.id === subTask2.id)).toBeUndefined(); // Should not be present
     });
 
-    it('should return tasks with recursive subtasks', async () => {
+    it('should return tasks with recursive subtasks (excluding deleted by default)', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
       await storage.createPlan(goal.id);
-      const parent = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null });
-      const child = await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parent.id });
-      const grandchild = await storage.addTask(goal.id, { title: 'Grandchild', description: '', parentId: child.id });
+      const parent = await storage.addTask(goal.id, { title: 'Parent', description: '', parentId: null, deleted: false });
+      const child = await storage.addTask(goal.id, { title: 'Child', description: '', parentId: parent.id, deleted: false });
+      const grandchild = await storage.addTask(goal.id, { title: 'Grandchild', description: '', parentId: child.id, deleted: false });
+      
+      await storage.removeTasks(goal.id, [child.id], true); // Soft delete child and grandchild
+
       const tasks = await storage.getTasks(goal.id, 'recursive');
-      expect(tasks.length).toBe(3);
+      expect(tasks.length).toBe(1); // Only parent should remain
       expect(tasks.find(t => t.id === parent.id)).toBeDefined();
-      expect(tasks.find(t => t.id === child.id)).toBeDefined();
-      expect(tasks.find(t => t.id === grandchild.id)).toBeDefined();
+      expect(tasks.find(t => t.id === child.id)).toBeUndefined();
+      expect(tasks.find(t => t.id === grandchild.id)).toBeUndefined();
+    });
+
+    it('should return deleted tasks when includeDeletedTasks is true', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false });
+      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null, deleted: false });
+      await storage.removeTasks(goal.id, [task2.id]); // Soft delete task 2
+
+      const tasks = await storage.getTasks(goal.id, 'recursive', true); // Include deleted
+      expect(tasks.length).toBe(2);
+      expect(tasks.find(t => t.id === task1.id)).toMatchObject({ deleted: false });
+      expect(tasks.find(t => t.id === task2.id)).toMatchObject({ deleted: true });
+    });
+
+    it('should return only non-deleted tasks when includeDeletedTasks is false', async () => {
+      const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
+      await storage.createPlan(goal.id);
+      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false });
+      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null, deleted: false });
+      await storage.removeTasks(goal.id, [task2.id]); // Soft delete task 2
+
+      const tasks = await storage.getTasks(goal.id, 'recursive', false); // Exclude deleted (default)
+      expect(tasks.length).toBe(1);
+      expect(tasks.find(t => t.id === task1.id)).toMatchObject({ deleted: false });
+      expect(tasks.find(t => t.id === task2.id)).toBeUndefined();
     });
   });
 
   describe('edge cases', () => {
-    it('updateParentTaskStatus should update parent if all siblings complete', async () => {
-      // Setup: parent exists, all siblings complete, parent not complete
+    it('updateParentTaskStatus should update parent if all non-deleted siblings complete', async () => {
+      // Setup: parent exists, all non-deleted siblings complete, parent not complete
       const goalId = 1;
       const parentId = '10';
-      const parentTask = { id: parentId, goalId, parentId: null, isComplete: false, updatedAt: '', $loki: 1, meta: {} };
+      const parentTask = { id: parentId, goalId, parentId: null, isComplete: false, updatedAt: '', deleted: false, $loki: 1, meta: {} };
       const siblingTasks = [
-        { id: '11', goalId, parentId, isComplete: true },
-        { id: '12', goalId, parentId, isComplete: true },
+        { id: '11', goalId, parentId, isComplete: true, deleted: false },
+        { id: '12', goalId, parentId, isComplete: true, deleted: false },
+        { id: '13', goalId, parentId, isComplete: false, deleted: true }, // Deleted and incomplete
       ];
       
       // Mock the collection methods
       const mockUpdate = vi.fn();
       (storage as any).tasks = {
         findOne: vi.fn().mockReturnValue(parentTask),
-        find: vi.fn().mockReturnValue(siblingTasks),
+        find: vi.fn((query: any) => {
+          // Simulate finding only non-deleted tasks for parent status check
+          if (query.deleted === false) {
+            return siblingTasks.filter(t => !t.deleted);
+          }
+          return siblingTasks; // For other finds
+        }),
         update: mockUpdate
       };
       
@@ -406,38 +658,41 @@ describe('Storage', () => {
       expect(result.completedParents).toEqual([]);
     });
 
-    it('handles recursive subtask updates', async () => {
+    it('handles recursive subtask updates considering deleted tasks', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
-      const plan = await storage.createPlan(goal.id);
+      await storage.createPlan(goal.id);
       const task1 = await storage.addTask(goal.id, { 
         title: 'Task 1',
         description: '',
-        parentId: null
+        parentId: null,
+        deleted: false
       });
       const task2 = await storage.addTask(goal.id, { 
         title: 'Task 2',
         description: '',
-        parentId: task1.id
+        parentId: task1.id,
+        deleted: false
       });
       const task3 = await storage.addTask(goal.id, { 
         title: 'Task 3',
         description: '',
-        parentId: task2.id
+        parentId: task2.id,
+        deleted: false
       });
       
       // Try to mark parent task complete when children are not complete
       await storage.completeTasksStatus(goal.id, [task1.id]);
-      const tasks = await storage.getTasks(goal.id, 'recursive');
-      const updatedTask1 = tasks.find(t => t.id === task1.id);
-      const updatedTask2 = tasks.find(t => t.id === task2.id);
-      const updatedTask3 = tasks.find(t => t.id === task3.id);
+      let tasks = await storage.getTasks(goal.id, 'recursive');
+      let updatedTask1 = tasks.find(t => t.id === task1.id);
+      let updatedTask2 = tasks.find(t => t.id === task2.id);
+      let updatedTask3 = tasks.find(t => t.id === task3.id);
       
       // Parent task should not be complete because children are not complete
       expect(updatedTask1?.isComplete).toBe(false);
       expect(updatedTask2?.isComplete).toBe(false);
       expect(updatedTask3?.isComplete).toBe(false);
       
-      // Now complete all children
+      // Now complete all non-deleted children
       await storage.completeTasksStatus(goal.id, [task3.id]);
       await storage.completeTasksStatus(goal.id, [task2.id]);
       
@@ -448,63 +703,76 @@ describe('Storage', () => {
       expect(finalTask1?.isComplete).toBe(true);
     });
 
-    it('handles parent status updates', async () => {
+    it('handles parent status updates considering deleted tasks', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
-      const plan = await storage.createPlan(goal.id);
+      await storage.createPlan(goal.id);
       const task1 = await storage.addTask(goal.id, { 
         title: 'Task 1',
         description: '',
-        parentId: null
+        parentId: null,
+        deleted: false
       });
       const task2 = await storage.addTask(goal.id, { 
         title: 'Task 2',
         description: '',
-        parentId: task1.id
+        parentId: task1.id,
+        deleted: false
       });
       const task3 = await storage.addTask(goal.id, { 
         title: 'Task 3',
         description: '',
-        parentId: task1.id
+        parentId: task1.id,
+        deleted: false
       });
-      await storage.completeTasksStatus(goal.id, [task2.id, task3.id]);
+      
+      // Soft delete task3
+      await storage.removeTasks(goal.id, [task3.id]);
+
+      // Complete task2 (the only remaining non-deleted child)
+      await storage.completeTasksStatus(goal.id, [task2.id]);
+      
       const tasks = await storage.getTasks(goal.id, 'none');
       const updatedTask1 = tasks.find(t => t.id === task1.id);
-      expect(updatedTask1?.isComplete).toBe(true);
+      expect(updatedTask1?.isComplete).toBe(true); // Parent should be complete
     });
 
-    it('completes parent task when pending subtask is deleted and all remaining subtasks are complete', async () => {
+    it('completes parent task when pending non-deleted subtask is deleted and all remaining non-deleted subtasks are complete', async () => {
       const goal = await storage.createGoal('Test Goal', 'https://github.com/test/repo');
-      const plan = await storage.createPlan(goal.id);
+      await storage.createPlan(goal.id);
       
       // Create a parent task with three subtasks
       const parentTask = await storage.addTask(goal.id, { 
         title: 'Parent Task',
         description: '',
-        parentId: null
+        parentId: null,
+        deleted: false
       });
       
       const subtask1 = await storage.addTask(goal.id, { 
         title: 'Subtask 1',
         description: '',
-        parentId: parentTask.id
+        parentId: parentTask.id,
+        deleted: false
       });
       
       const subtask2 = await storage.addTask(goal.id, { 
         title: 'Subtask 2',
         description: '',
-        parentId: parentTask.id
+        parentId: parentTask.id,
+        deleted: false
       });
       
       const subtask3 = await storage.addTask(goal.id, { 
         title: 'Subtask 3',
         description: '',
-        parentId: parentTask.id
+        parentId: parentTask.id,
+        deleted: false
       });
 
       // Complete two subtasks
       await storage.completeTasksStatus(goal.id, [subtask1.id, subtask2.id]);
       
-      // Delete the pending subtask
+      // Soft delete the pending subtask
       const result = await storage.removeTasks(goal.id, [subtask3.id]);
       
       // Verify that the parent task was completed
@@ -513,45 +781,47 @@ describe('Storage', () => {
       expect(result.completedParents[0].isComplete).toBe(true);
     });
 
-    it('should reorder sibling tasks and update their IDs after removal', async () => {
-      const goal = await storage.createGoal('Test Goal for Reordering', 'https://github.com/test/reorder');
+    it('should not reorder sibling tasks and update their IDs after soft removal', async () => {
+      const goal = await storage.createGoal('Test Goal for No Reordering', 'https://github.com/test/noreorder');
       await storage.createPlan(goal.id);
 
       // Add top-level tasks
-      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null }); // id: "1"
-      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null }); // id: "2"
-      const task3 = await storage.addTask(goal.id, { title: 'Task 3', description: '', parentId: null }); // id: "3"
+      const task1 = await storage.addTask(goal.id, { title: 'Task 1', description: '', parentId: null, deleted: false }); // id: "1"
+      const task2 = await storage.addTask(goal.id, { title: 'Task 2', description: '', parentId: null, deleted: false }); // id: "2"
+      const task3 = await storage.addTask(goal.id, { title: 'Task 3', description: '', parentId: null, deleted: false }); // id: "3"
 
-      // Add subtasks to Task 2 (which will become Task 1 after removal of Task 1)
-      const subtask2_1 = await storage.addTask(goal.id, { title: 'Subtask 2.1', description: '', parentId: task2.id }); // id: "2.1"
-      const subtask2_2 = await storage.addTask(goal.id, { title: 'Subtask 2.2', description: '', parentId: task2.id }); // id: "2.2"
+      // Add subtasks to Task 2
+      const subtask2_1 = await storage.addTask(goal.id, { title: 'Subtask 2.1', description: '', parentId: task2.id, deleted: false }); // id: "2.1"
+      const subtask2_2 = await storage.addTask(goal.id, { title: 'Subtask 2.2', description: '', parentId: task2.id, deleted: false }); // id: "2.2"
 
-      // Remove Task 1 (top-level)
+      // Soft remove Task 1 (top-level)
       const removeResult1 = await storage.removeTasks(goal.id, [task1.id]);
       expect(removeResult1.removedTasks.length).toBe(1);
       expect(removeResult1.removedTasks[0].id).toBe(task1.id);
+      expect(removeResult1.removedTasks[0].deleted).toBe(true);
 
-      // Verify top-level tasks are reordered: Task 2 should become '1', Task 3 should become '2'
-      const topLevelTasksAfterRemoval1 = await storage.getTasks(goal.id, 'none');
-      expect(topLevelTasksAfterRemoval1.length).toBe(2);
-      expect(topLevelTasksAfterRemoval1[0].id).toBe('1'); // Task 2 reordered to '1'
-      expect(topLevelTasksAfterRemoval1[0].title).toBe('Task 2');
-      expect(topLevelTasksAfterRemoval1[1].id).toBe('2'); // Task 3 reordered to '2'
-      expect(topLevelTasksAfterRemoval1[1].title).toBe('Task 3');
+      // Verify top-level tasks IDs are NOT reordered
+      const allTasksInDb = (storage as any).tasks.find({ goalId: goal.id });
+      expect(allTasksInDb.find((t: any) => t.id === '1')?.title).toBe('Task 1');
+      expect(allTasksInDb.find((t: any) => t.id === '1')?.deleted).toBe(true);
+      expect(allTasksInDb.find((t: any) => t.id === '2')?.title).toBe('Task 2');
+      expect(allTasksInDb.find((t: any) => t.id === '3')?.title).toBe('Task 3');
 
-      // Verify subtasks of original Task 2 (now Task 1) have their parentId updated
-      // Note: TaskResponse does not include parentId, so we cannot directly assert it.
-      // We rely on the fact that the storage logic correctly updates parentIds internally.
-      const directChildrenOfNewParentTask1 = await storage.getTasks(goal.id, 'first-level');
-      // Filter to ensure we are looking at children of the *new* parent ID '1'
-      const childrenOfNewParent = directChildrenOfNewParentTask1.filter(t => t.id.startsWith('1.'));
+      // Verify getTasks (default, no deleted) returns correct order and IDs
+      const nonDeletedTopLevelTasks = await storage.getTasks(goal.id, 'none');
+      expect(nonDeletedTopLevelTasks.length).toBe(2);
+      expect(nonDeletedTopLevelTasks[0].id).toBe('2'); // Original Task 2
+      expect(nonDeletedTopLevelTasks[1].id).toBe('3'); // Original Task 3
 
-      expect(childrenOfNewParent.length).toBe(2);
-      expect(childrenOfNewParent[0].id).toBe('1.1'); // Original subtask 2.1, now 1.1
-      expect(childrenOfNewParent[0].title).toBe('Subtask 2.1');
+      // Verify subtasks of original Task 2 still have their original parentId
+      const directChildrenOfTask2 = await storage.getTasks(goal.id, 'first-level');
+      const childrenOfOriginalTask2 = directChildrenOfTask2.filter(t => t.id.startsWith('2.'));
 
-      expect(childrenOfNewParent[1].id).toBe('1.2'); // Original subtask 2.2, now 1.2
-      expect(childrenOfNewParent[1].title).toBe('Subtask 2.2');
+      expect(childrenOfOriginalTask2.length).toBe(2);
+      expect(childrenOfOriginalTask2[0].id).toBe('2.1');
+      expect(childrenOfOriginalTask2[0].title).toBe('Subtask 2.1');
+      expect(childrenOfOriginalTask2[1].id).toBe('2.2');
+      expect(childrenOfOriginalTask2[1].title).toBe('Subtask 2.2');
     });
   });
 });

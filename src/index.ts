@@ -57,7 +57,7 @@ export class SoftwarePlanningServer {
         },
         {
           name: 'add_tasks',
-          description: 'Add multiple tasks to a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1") where each segment represents a level in the hierarchy. The parentId for a subtask is derived from its ID by removing the last segment (e.g., "1.1" is parent of "1.1.1"). Top-level tasks have a null parentId. Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          description: 'Add multiple tasks to a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1") where each segment represents a level in the hierarchy. Top-level tasks have a null parentId. The `parentId` for a subtask must refer to the ID of an *already existing* task. In-batch parent task ID resolution is not supported. Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -67,10 +67,10 @@ export class SoftwarePlanningServer {
               },
               tasks: {
                 type: 'array',
-                description: 'An array of new task objects to be added. Each task object must include "title" (string) and "description" (string), and can optionally include "parentId" (string) to define subtasks. Note: The returned task objects will not include `createdAt`, `updatedAt`, or `parentId`.',
+                description: 'An array of new task objects to be added. Each task object must include "title" (string) and "description" (string), and can optionally include "parentId" (string) to define subtasks. The `parentId` must be the ID of an *already existing* task. If `parentId` is null, it will be a top-level task.',
                 items: {
                   type: 'object',
-                  description: 'A single task object. It has the following properties: "title" (string), "description" (string), and optionally "parentId" (string) for subtasks. The `parentId` should be the ID of an existing task. If `parentId` is null, it will be a top-level task.',
+                  description: 'A single task object. It has the following properties: "title" (string), "description" (string), and optionally "parentId" (string) for subtasks.',
                   properties: {
                     title: {
                       type: 'string',
@@ -82,7 +82,7 @@ export class SoftwarePlanningServer {
                     },
                     parentId: {
                       type: ['string', 'null'],
-                      description: 'Optional parent task ID for subtasks (string). Use null for top-level tasks. Example: "1" for a top-level task, "1.1" for a subtask of "1".',
+                      description: 'Optional parent task ID for subtasks (string). Use null for top-level tasks. Must be the ID of an *already existing* task.',
                     },
                   },
                   required: ['title', 'description'],
@@ -94,7 +94,7 @@ export class SoftwarePlanningServer {
         },
         {
           name: 'remove_tasks',
-          description: 'Remove multiple tasks from a goal. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`.',
+          description: 'Soft-delete multiple tasks from a goal. Tasks are marked as deleted but remain in the system. Task IDs use a dot-notation (e.g., "1", "1.1", "1.1.1"). Responses will return simplified task objects without `createdAt`, `updatedAt`, or `parentId`. Soft-deleted tasks are excluded by default from `get_tasks` results unless `includeDeletedTasks` is set to true.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -133,6 +133,11 @@ export class SoftwarePlanningServer {
                 description: 'Level of subtasks to include: "none" (only top-level tasks), "first-level" (top-level tasks and their direct children), or "recursive" (all nested subtasks). Defaults to "none".',
                 enum: ['none', 'first-level', 'recursive'],
                 default: 'none',
+              },
+              includeDeletedTasks: {
+                type: 'boolean',
+                description: 'Whether to include soft-deleted tasks in the results (boolean). Defaults to false.',
+                default: false,
               },
             },
             required: ['goalId'],
@@ -196,30 +201,33 @@ export class SoftwarePlanningServer {
           };
 
           const addedTasks: TaskResponse[] = [];
-          const currentBatchTitleToIdMap = new Map<string, string>();
+          // ParentId must refer to an already existing task in the database.
+          // In-batch parentId resolution is not supported with the current input schema.
 
-          const existingTasks = await storage.getTasks(goalId, 'recursive');
-          const existingTitleToIdMap = new Map<string, string>();
-          existingTasks.forEach(task => existingTitleToIdMap.set(task.title, task.id));
+          const existingTasks = await storage.getTasks(goalId, 'recursive', true);
+          const existingIdSet = new Set<string>(existingTasks.map(t => t.id));
 
           for (const task of tasks) {
             let resolvedParentId: string | null = null;
-            if (task.parentId) {
-              resolvedParentId = currentBatchTitleToIdMap.get(task.parentId) ?? null;
-              if (!resolvedParentId) {
-                resolvedParentId = existingTitleToIdMap.get(task.parentId) ?? null;
+            if (task.parentId !== null) {
+              if (existingIdSet.has(task.parentId)) {
+                resolvedParentId = task.parentId;
+              } else {
+                throw new McpError(ErrorCode.InvalidParams, `Parent task with ID "${task.parentId}" not found.`);
               }
             }
 
             const newTask = await storage.addTask(goalId, {
-              ...task,
-              parentId: resolvedParentId
+              title: task.title,
+              description: task.description,
+              parentId: resolvedParentId,
+              // The 'deleted' property is required by the Omit<Task, ...> type in storage.addTask
+              deleted: false, 
             });
             addedTasks.push(newTask);
-            currentBatchTitleToIdMap.set(newTask.title, newTask.id);
           }
 
-          await storage.initialize();
+          // No need to call storage.initialize() here, it's done in the constructor/start
           const allTasksInDb = await storage.getTasks(goalId, 'recursive');
           const totalTasksInDb = allTasksInDb.length;
 
@@ -243,25 +251,26 @@ export class SoftwarePlanningServer {
               {
                 type: 'text',
                 text: textContent,
-              } as { type: 'text'; text: string },
+              },
             ],
           };
         }
 
         case 'get_tasks': {
-          const { goalId, includeSubtasks = 'none' } = request.params.arguments as { 
+          const { goalId, includeSubtasks = 'none', includeDeletedTasks = false } = request.params.arguments as { 
             goalId: number; 
             includeSubtasks?: 'none' | 'first-level' | 'recursive';
+            includeDeletedTasks?: boolean;
           };
-          await storage.initialize();
-          const tasks = await storage.getTasks(goalId, includeSubtasks);
+          // No need to call storage.initialize() here
+          const tasks = await storage.getTasks(goalId, includeSubtasks, includeDeletedTasks);
           const textContent = JSON.stringify(tasks, null, 2);
           return {
             content: [
               {
                 type: 'text',
                 text: textContent,
-              } as { type: 'text'; text: string },
+              },
             ],
           };
         }
