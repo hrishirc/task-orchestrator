@@ -2,6 +2,12 @@
 
 A Model Context Protocol (MCP) server for task orchestration and management. This tool helps break down goals into manageable tasks and track their progress.
 
+## How to use
+
+Ideally, the LLM should be able to understand when this MCP tool should be used. But as a sample prompt, something like this can possibly work
+
+"Create a new development goal for me. The goal is to 'Implement user authentication' and it's for the 'my-web-app' repository."
+
 ## Features
 
 - Create and manage goals
