@@ -49,10 +49,10 @@ export class SoftwarePlanningServer {
               },
               repoName: {
                 type: 'string',
-                description: 'The repository name associated with this goal (string)',
+                description: 'Please give the name of the project that you are currently working on (string)',
               },
             },
-            required: ['description', 'repoName'],
+            required: ['description'],
           },
         },
         {
