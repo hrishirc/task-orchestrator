@@ -8,7 +8,7 @@ Ideally, the LLM should be able to understand when this MCP tool should be used.
 
 "Create a new development goal for me. The goal is to 'Implement user authentication' and it's for the 'my-web-app' repository."
 
-LEMME KNOW of any issues you face in the 'discussions' tab.
+LEMME KNOW of any issues you face by creating a new issue in the 'Discussions' tab at the top.
 
 ## Features
 
