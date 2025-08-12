@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server for task orchestration and management. This tool helps break down goals into manageable tasks and track their progress.
 
+<a href="https://glama.ai/mcp/servers/@hrishirc/task-orchestrator">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@hrishirc/task-orchestrator/badge" alt="Task Orchestration MCP server" />
+</a>
+
 ## How to use
 
 Ideally, the LLM should be able to understand when this MCP tool should be used. But as a sample prompt, something like this can possibly work
